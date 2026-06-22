@@ -41,6 +41,8 @@ dependencies:
   url_launcher: ^6.3.0
   # PhonePad と揃えたフォント（Inter）
   google_fonts: ^6.2.1
+  # オフライン連続ストリーミング音声認識（マイク握りっぱなし＝隙間なし）
+  vosk_flutter_2: ^1.0.5
   # bot のユーザー名などの保存
   shared_preferences: ^2.3.2
 
@@ -72,6 +74,7 @@ flutter:
   assets:
     - assets/icon/app_icon_dark.png
     - assets/icon/app_icon_light.png
+    - assets/models/vosk-model-small-ja-0.22.zip
 
   # To add assets to your application, add an assets section, like this:
   # assets:

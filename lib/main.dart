@@ -1,10 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:speech_to_text/speech_to_text.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:vosk_flutter_2/vosk_flutter_2.dart';
 
 import 'theme.dart';
 
@@ -34,7 +35,7 @@ class KoeSecretaryApp extends StatelessWidget {
   }
 }
 
-enum AppStatus { idle, listening, opening }
+enum AppStatus { loading, idle, listening, opening }
 
 ThemeMode _parseMode(String? v) {
   switch (v) {
@@ -65,8 +66,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   static const _kCountdownSecs = 'countdown_secs';
   static const _kThemeMode = 'theme_mode';
 
-  final SpeechToText _speech = SpeechToText();
   final ScrollController _previewScroll = ScrollController();
+
+  // Vosk（オフライン連続ストリーミング認識）。マイク握りっぱなし＝隙間なし。
+  final VoskFlutterPlugin _vosk = VoskFlutterPlugin.instance();
+  SpeechService? _speechService;
+  bool _modelReady = false;
+  StreamSubscription<String>? _partialSub;
+  StreamSubscription<String>? _resultSub;
 
   String _provider = 'telegram';
   String _customTemplate = '';
@@ -75,17 +82,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // 文末でこの語を言うと送信カウントダウン開始。
   String _trigger = '送信して';
   int _countdownSecs = 3;
-  bool _speechReady = false;
   bool _didAutoStart = false;
   // 送信先アプリへ離れて戻ってきた直後は、勝手に聞き始めない。
   bool _returningFromTarget = false;
-  // 自動継続（聞き直し）の二重起動防止＆連続失敗時のフォールバック判定。
-  bool _restarting = false;
-  int _failCount = 0;
-  DateTime? _lastErrorAt;
 
-  AppStatus _status = AppStatus.idle;
-  String _partial = ''; // 現在の認識セグメント
+  AppStatus _status = AppStatus.loading;
+  String _partial = ''; // 現在の認識中（interim）
   String _accumulated = ''; // 確定済みの積み上げ
   String _lastText = '';
 
@@ -105,27 +107,28 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _countdownTimer?.cancel();
     _previewScroll.dispose();
-    _speech.cancel();
+    _partialSub?.cancel();
+    _resultSub?.cancel();
+    _speechService?.stop();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state != AppLifecycleState.resumed) return;
-    // 「OK Google、◯◯を開いて」で前面に戻るたびに自動で聞き始める。
+    // 送信先アプリから戻ってきた直後の1回は、勝手に聞き始めない。
     if (_returningFromTarget) {
       _returningFromTarget = false;
       return;
     }
     if (_autoListen &&
         _isConfigured &&
-        _speechReady &&
+        _modelReady &&
         _status == AppStatus.idle &&
-        !_speech.isListening &&
         _accumulated.isEmpty &&
         _partial.isEmpty &&
         _countdown == null) {
-      _startFresh();
+      _startListening();
     }
   }
 
@@ -139,16 +142,37 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _countdownSecs = prefs.getInt(_kCountdownSecs) ?? 3;
     themeMode.value = _parseMode(prefs.getString(_kThemeMode));
 
-    _speechReady = await _speech.initialize(
-      onStatus: _onSpeechStatus,
-      onError: (_) => _onSpeechError(),
-    );
-    if (!mounted) return;
-    setState(() {});
+    await _initVosk();
+  }
 
-    if (_autoListen && _isConfigured && _speechReady && !_didAutoStart) {
+  /// Vosk モデルをロードし、連続認識サービスを用意する（初回はzip展開で少し時間）。
+  Future<void> _initVosk() async {
+    try {
+      final modelPath = await ModelLoader()
+          .loadFromAssets('assets/models/vosk-model-small-ja-0.22.zip');
+      final model = await _vosk.createModel(modelPath);
+      final recognizer = await _vosk.createRecognizer(
+        model: model,
+        sampleRate: 16000,
+      );
+      _speechService = await _vosk.initSpeechService(recognizer);
+      _partialSub = _speechService!.onPartial().listen(_onPartial);
+      _resultSub = _speechService!.onResult().listen(_onResult);
+      _modelReady = true;
+    } catch (e) {
+      _modelReady = false;
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('音声モデルの準備に失敗しました: $e')),
+        );
+      }
+    }
+    if (!mounted) return;
+    setState(() => _status = AppStatus.idle);
+
+    if (_autoListen && _isConfigured && _modelReady && !_didAutoStart) {
       _didAutoStart = true;
-      WidgetsBinding.instance.addPostFrameCallback((_) => _startFresh());
+      WidgetsBinding.instance.addPostFrameCallback((_) => _startListening());
     }
   }
 
@@ -156,69 +180,31 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       ? _bot.isNotEmpty
       : _customTemplate.contains('{text}');
 
-  // フレーズで区切れても、自動で聞き直して継続（確定結果は finalResult で積み上げ済み）。
-  void _onSpeechStatus(String status) {
-    if (!mounted) return;
-    if (status != 'done' && status != 'notListening') return;
-    if (_status != AppStatus.listening) return;
-    _commitSegment();
-    _relisten();
+  String _extract(String jsonStr, String key) {
+    try {
+      final m = jsonDecode(jsonStr);
+      if (m is Map && m[key] is String) return m[key] as String;
+    } catch (_) {}
+    return '';
   }
 
-  void _onSpeechError() {
-    if (!mounted) return;
-    if (_status != AppStatus.listening) {
-      setState(() => _status = AppStatus.idle);
-      return;
-    }
-    _commitSegment();
-    // 短時間に失敗が続いたら（不安定）自動継続をやめて待機にフォールバック。
-    final now = DateTime.now();
-    if (_lastErrorAt != null &&
-        now.difference(_lastErrorAt!).inMilliseconds < 1200) {
-      _failCount++;
-    } else {
-      _failCount = 1;
-    }
-    _lastErrorAt = now;
-    if (_failCount >= 5) {
-      _failCount = 0;
-      try {
-        _speech.cancel();
-      } catch (_) {}
-      setState(() => _status = AppStatus.idle); // 待機（続けて話す/送信が出る）
-      return;
-    }
-    _relisten();
+  /// 認識中（interim）。連続ストリームなので隙間なく更新される。
+  void _onPartial(String json) {
+    if (!mounted || _status != AppStatus.listening) return;
+    _partial = _extract(json, 'partial');
+    setState(() {});
+    _evaluateTrigger();
   }
 
-  /// 直前セッションを確実に止めてから聞き直す（本文は保持）。
-  void _relisten() {
-    if (_restarting) return;
-    _restarting = true;
-    Future.delayed(const Duration(milliseconds: 250), () async {
-      try {
-        if (!mounted || _status != AppStatus.listening) return;
-        if (_speech.isListening) {
-          try {
-            await _speech.stop();
-          } catch (_) {}
-          await Future.delayed(const Duration(milliseconds: 120));
-        }
-        if (!mounted || _status != AppStatus.listening) return;
-        await _beginListen();
-      } finally {
-        _restarting = false;
-      }
-    });
-  }
-
-  /// notListening 時の取りこぼし回収（通常は finalResult が積み上げ済みで partial は空）。
-  void _commitSegment() {
-    if (_partial.trim().isNotEmpty) {
-      _accumulated = '$_accumulated ${_partial.trim()}'.trim();
+  /// フレーズ確定。確定分は accumulated に追記して固定（巻き戻らない）。
+  void _onResult(String json) {
+    if (!mounted || _status != AppStatus.listening) return;
+    final text = _extract(json, 'text').trim();
+    if (text.isNotEmpty) {
+      _accumulated = '$_accumulated $text'.trim();
     }
     _partial = '';
+    setState(() {});
     _evaluateTrigger();
   }
 
@@ -262,12 +248,45 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (mounted) setState(() => _countdown = null);
   }
 
-  /// 送信本文。トリガー語は（途中で取りやめた分も含め）全て除去し、本文は丸ごと引き継ぐ。
+  /// 送信本文。Voskの日本語は形態素ごとに空白が入るので全スペース除去し、
+  /// トリガー語は（途中で取りやめた分も含め）全て除去する。
   String _sendBody() {
-    var body = '$_accumulated $_partial';
-    final trig = _trigger.trim();
-    if (trig.isNotEmpty) body = body.replaceAll(trig, ' ');
-    return body.replaceAll(RegExp(r'\s+'), ' ').trim();
+    var body = '$_accumulated $_partial'.replaceAll(RegExp(r'\s+'), '');
+    final trig = _triggerKey;
+    if (trig.isNotEmpty) body = body.replaceAll(trig, '');
+    return body.trim();
+  }
+
+  /// 連続認識を開始（本文クリア）。Voskはマイクを握りっぱなしで流し続ける。
+  Future<void> _startListening() async {
+    if (!_modelReady || _speechService == null) return;
+    if (!_isConfigured) {
+      _openSettings();
+      return;
+    }
+    _accumulated = '';
+    _partial = '';
+    _cancelCountdown();
+    try {
+      await _speechService!.start();
+    } catch (_) {}
+    if (mounted) setState(() => _status = AppStatus.listening);
+  }
+
+  Future<void> _stopService() async {
+    try {
+      await _speechService?.stop();
+    } catch (_) {}
+  }
+
+  /// 本文を保持したまま連続認識を再開（「続けて話す」用）。
+  Future<void> _resumeListening() async {
+    if (!_modelReady || _speechService == null) return;
+    _cancelCountdown();
+    try {
+      await _speechService!.start();
+    } catch (_) {}
+    if (mounted) setState(() => _status = AppStatus.listening);
   }
 
   /// 今すぐ送信（カウントダウン0・「今すぐ送信」・手動タップ共通）。
@@ -276,13 +295,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _countdownTimer = null;
     _countdown = null;
     final text = _sendBody();
-    _speech.cancel();
+    _stopService();
     _accumulated = '';
     _partial = '';
     if (text.isEmpty) {
       // 本文が空なら送らず、聞き直す。
       setState(() {});
-      _startFresh();
+      _startListening();
       return;
     }
     setState(() {
@@ -292,71 +311,27 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _openTarget(text);
   }
 
-  /// 新規に聞き始める（本文クリア）。アイドルからのタップ／起動時／送信後用。
-  Future<void> _startFresh() async {
-    if (!_speechReady) {
-      _speechReady = await _speech.initialize(
-        onStatus: _onSpeechStatus,
-        onError: (_) => _onSpeechError(),
-      );
-      if (!_speechReady) return;
-    }
-    if (!_isConfigured) {
-      _openSettings();
-      return;
-    }
+  /// リセット：書き起こしを全部消す（連続認識はそのまま継続）。
+  void _reset() {
+    _cancelCountdown();
     _accumulated = '';
     _partial = '';
-    _failCount = 0;
-    _cancelCountdown();
-    if (_speech.isListening) {
-      try {
-        await _speech.stop();
-      } catch (_) {}
-      await Future.delayed(const Duration(milliseconds: 120));
+    _lastText = '';
+    if (_status == AppStatus.listening) {
+      setState(() {});
+    } else {
+      _startListening();
     }
-    await _beginListen();
   }
 
-  /// 実際の listen 呼び出し（本文は保持）。
-  Future<void> _beginListen() async {
-    if (!mounted || _speech.isListening) return;
-    setState(() {
-      _status = AppStatus.listening;
-      _partial = '';
-    });
-    await _speech.listen(
-      listenOptions: SpeechListenOptions(
-        partialResults: true,
-        cancelOnError: false, // エラーでも自前で聞き直す
-        listenMode: ListenMode.dictation,
-        localeId: 'ja_JP',
-        pauseFor: const Duration(seconds: 4),
-      ),
-      onResult: (result) {
-        if (!mounted) return;
-        // 確定結果は即 accumulated に固定（巻き戻り防止）。interim は partial に。
-        if (result.finalResult) {
-          final w = result.recognizedWords.trim();
-          if (w.isNotEmpty) _accumulated = '$_accumulated $w'.trim();
-          _partial = '';
-        } else {
-          _partial = result.recognizedWords;
-        }
-        setState(() {});
-        _evaluateTrigger();
-      },
-    );
-  }
-
-  /// マイクタップ：本文があれば今すぐ送信、無ければリスニング停止。
+  /// マイクタップ：本文があれば今すぐ送信、無ければ停止/開始。
   void _toggleMic() {
     if (_status == AppStatus.listening) {
       if (_sendBody().isNotEmpty) {
         _sendNow();
       } else {
         _cancelCountdown();
-        _speech.cancel();
+        _stopService();
         _accumulated = '';
         setState(() {
           _status = AppStatus.idle;
@@ -364,7 +339,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         });
       }
     } else if (_status == AppStatus.idle) {
-      _startFresh();
+      _startListening();
     }
   }
 
@@ -579,6 +554,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     final t = context.tokens;
     final isDark = Theme.of(context).brightness == Brightness.dark;
+    final loading = _status == AppStatus.loading;
     final listening = _status == AppStatus.listening;
     final opening = _status == AppStatus.opening;
     final counting = _countdown != null;
@@ -650,15 +626,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 ),
               const SizedBox(height: 4),
               Text(
-                counting
-                    ? '送信まで $_countdown'
-                    : listening
-                        ? '聞いてるよ…（「$_trigger」で送信）'
-                        : paused
-                            ? '続けて話す or 送信'
-                            : shown.isEmpty
-                                ? 'マイクを押して話しかけてね'
-                                : '送信したよ',
+                loading
+                    ? '音声モデルを準備中…（初回のみ）'
+                    : counting
+                        ? '送信まで $_countdown'
+                        : listening
+                            ? '聞いてるよ…（「$_trigger」で送信）'
+                            : paused
+                                ? '続けて話す or 送信'
+                                : shown.isEmpty
+                                    ? 'マイクを押して話しかけてね'
+                                    : '送信したよ',
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   color: (listening || counting) ? t.accent : t.text,
@@ -678,7 +656,18 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     borderRadius: BorderRadius.circular(AppRadius.surface),
                     border: Border.all(color: t.hairline),
                   ),
-                  child: shown.isEmpty
+                  child: loading
+                      ? Center(
+                          child: SizedBox(
+                            width: 28,
+                            height: 28,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2.5,
+                              color: t.accent,
+                            ),
+                          ),
+                        )
+                      : shown.isEmpty
                       ? Center(
                           child: Text(
                             'ここに認識結果が出るよ',
@@ -714,6 +703,18 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     label: const Text('送信先をもう一度開く'),
                   ),
                 ),
+              // リセット（書き起こしがズレた時にやり直す）。
+              if (!counting && !opening && (listening || paused))
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: Center(
+                    child: TextButton.icon(
+                      onPressed: _reset,
+                      icon: const Icon(Icons.refresh, size: 18),
+                      label: const Text('リセット'),
+                    ),
+                  ),
+                ),
               if (counting)
                 Padding(
                   padding: const EdgeInsets.only(bottom: 16),
@@ -743,7 +744,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     children: [
                       Expanded(
                         child: OutlinedButton.icon(
-                          onPressed: opening ? null : () => _beginListen(),
+                          onPressed: opening ? null : () => _resumeListening(),
                           icon: const Icon(Icons.mic),
                           label: const Text('続けて話す'),
                         ),
@@ -759,7 +760,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     ],
                   ),
                 )
-              else
+              else if (!loading)
                 _MicButton(
                   listening: listening,
                   opening: opening,
