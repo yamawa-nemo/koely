@@ -35,8 +35,9 @@ The agent that actually *does* things (e.g. a Telegram bot wired to an LLM) live
 
 - **Hands-free launch** via *"Hey Google, open コエリー"*; auto-starts listening every time it comes to the foreground.
 - **Speak → pre-filled message** in the target chat (one tap to send).
+- **Voice send trigger:** say a configurable word (default 「送信して」) at the end and a short countdown fires, then it opens the chat — fully hands-free. Keep talking and the countdown resets.
+- **Continuous dictation:** keeps listening through phrase pauses (re-arms across Android's silence cutoffs); finalized words are locked in so the transcript never rolls back.
 - **Providers:** Telegram (bot username) or a **Custom URL template** with a `{text}` placeholder → works with LINE, WhatsApp, SMS, and more.
-- **Long-form mode:** keeps listening through pauses until you stop, working around Android's aggressive silence cutoff.
 - **System / Light / Dark** themes with a custom sliding toggle.
 - A small, **portable design system** (`lib/theme.dart`) so the same look drops into future apps.
 
@@ -60,8 +61,8 @@ The agent that actually *does* things (e.g. a Telegram bot wired to an LLM) live
 - **Why Telegram + a generic Custom template, instead of per-app integrations?**
   A `{text}` URL template covers any app that exposes a prefill deep link (LINE, WhatsApp, SMS, Signal…) with **zero extra code** — far more maintainable for an OSS tool than hardcoding each provider.
 
-- **Long-form mode & the Android speech quirk.**
-  Android's `SpeechRecognizer` ends on its *own* ~2s silence and largely ignores longer pause settings. Long-form mode re-arms the recognizer on each silence/error and accumulates the transcript until you explicitly stop — so thinking pauses don't cut you off mid-sentence.
+- **Keyword send + the Android speech quirk.**
+  Android's `SpeechRecognizer` finalizes on its *own* ~2s silence (and by phrase), largely ignoring longer pause settings — so a plain "send after N seconds of silence" fires unpredictably. Koely instead **sends on a spoken trigger word** and re-arms the recognizer across cutoffs to keep one continuous transcript. Crucially, **final results are committed immediately** (interim results only live in a separate buffer), so re-arming never rolls back or drops text.
 
 - **Design system.**
   Colors, radii, and typography live in `lib/theme.dart` as portable tokens, so the visual language is reusable across apps. Latin text uses **Inter**; Japanese falls back to **Noto Sans JP** (Inter ships no Japanese glyphs).
@@ -85,7 +86,8 @@ flutter build apk --release
 2. Pick a **provider**:
    - **Telegram** — enter your bot's username (without `@`).
    - **Custom** — enter a URL template containing `{text}`.
-3. Optionally toggle auto-listen, auto-open, long-form mode, and the theme.
+3. Set the **trigger word** (default 「送信して」) and the **countdown seconds** (2–8s).
+4. Optionally toggle auto-listen and pick a theme.
 
 ### Hands-free trigger
 

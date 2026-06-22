@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -59,30 +61,37 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   static const _kProvider = 'provider'; // telegram / custom
   static const _kCustomTemplate = 'custom_template';
   static const _kAutoListen = 'auto_listen';
-  static const _kAutoOpen = 'auto_open';
-  static const _kLongMode = 'long_mode';
+  static const _kTrigger = 'trigger_phrase';
+  static const _kCountdownSecs = 'countdown_secs';
   static const _kThemeMode = 'theme_mode';
 
   final SpeechToText _speech = SpeechToText();
+  final ScrollController _previewScroll = ScrollController();
 
   String _provider = 'telegram';
   String _customTemplate = '';
   String _bot = '';
   bool _autoListen = true;
-  bool _autoOpen = true;
-  // 長文モード：無音で勝手に送らず、自分で停止するまで聞き続ける。
-  bool _longMode = false;
+  // 文末でこの語を言うと送信カウントダウン開始。
+  String _trigger = '送信して';
+  int _countdownSecs = 3;
   bool _speechReady = false;
   bool _didAutoStart = false;
-  // Telegram を開いて戻ってきた直後は、勝手に聞き始めない。
-  bool _returningFromTelegram = false;
-  // 長文モードで、ユーザーが「停止して送信」を押したか。
-  bool _finishing = false;
+  // 送信先アプリへ離れて戻ってきた直後は、勝手に聞き始めない。
+  bool _returningFromTarget = false;
+  // 自動継続（聞き直し）の二重起動防止＆連続失敗時のフォールバック判定。
+  bool _restarting = false;
+  int _failCount = 0;
+  DateTime? _lastErrorAt;
 
   AppStatus _status = AppStatus.idle;
   String _partial = ''; // 現在の認識セグメント
-  String _accumulated = ''; // 確定済みの積み上げ（長文モード）
+  String _accumulated = ''; // 確定済みの積み上げ
   String _lastText = '';
+
+  // 送信カウントダウン（null = 非カウント中）。
+  int? _countdown;
+  Timer? _countdownTimer;
 
   @override
   void initState() {
@@ -94,6 +103,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _countdownTimer?.cancel();
+    _previewScroll.dispose();
     _speech.cancel();
     super.dispose();
   }
@@ -102,12 +113,19 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state != AppLifecycleState.resumed) return;
     // 「OK Google、◯◯を開いて」で前面に戻るたびに自動で聞き始める。
-    if (_returningFromTelegram) {
-      _returningFromTelegram = false;
+    if (_returningFromTarget) {
+      _returningFromTarget = false;
       return;
     }
-    if (_autoListen && _isConfigured && _speechReady && _status == AppStatus.idle) {
-      _startListening();
+    if (_autoListen &&
+        _isConfigured &&
+        _speechReady &&
+        _status == AppStatus.idle &&
+        !_speech.isListening &&
+        _accumulated.isEmpty &&
+        _partial.isEmpty &&
+        _countdown == null) {
+      _startFresh();
     }
   }
 
@@ -117,8 +135,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _provider = prefs.getString(_kProvider) ?? 'telegram';
     _customTemplate = prefs.getString(_kCustomTemplate) ?? '';
     _autoListen = prefs.getBool(_kAutoListen) ?? true;
-    _autoOpen = prefs.getBool(_kAutoOpen) ?? true;
-    _longMode = prefs.getBool(_kLongMode) ?? false;
+    _trigger = prefs.getString(_kTrigger) ?? '送信して';
+    _countdownSecs = prefs.getInt(_kCountdownSecs) ?? 3;
     themeMode.value = _parseMode(prefs.getString(_kThemeMode));
 
     _speechReady = await _speech.initialize(
@@ -130,7 +148,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
     if (_autoListen && _isConfigured && _speechReady && !_didAutoStart) {
       _didAutoStart = true;
-      WidgetsBinding.instance.addPostFrameCallback((_) => _startListening());
+      WidgetsBinding.instance.addPostFrameCallback((_) => _startFresh());
     }
   }
 
@@ -138,74 +156,171 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       ? _bot.isNotEmpty
       : _customTemplate.contains('{text}');
 
+  // フレーズで区切れても、自動で聞き直して継続（確定結果は finalResult で積み上げ済み）。
   void _onSpeechStatus(String status) {
     if (!mounted) return;
     if (status != 'done' && status != 'notListening') return;
     if (_status != AppStatus.listening) return;
     _commitSegment();
-    // 長文モードかつ未確定なら、無音で切れても聞き直して continue。
-    if (_longMode && !_finishing) {
-      _scheduleLongRestart();
-      return;
-    }
-    _finalizeAndOpen();
+    _relisten();
   }
 
-  /// 認識エラー（無音タイムアウト等）。長文モード中は終了扱いにせず聞き直す。
   void _onSpeechError() {
     if (!mounted) return;
-    if (_longMode && !_finishing && _status == AppStatus.listening) {
-      _commitSegment();
-      _scheduleLongRestart();
+    if (_status != AppStatus.listening) {
+      setState(() => _status = AppStatus.idle);
       return;
     }
-    setState(() => _status = AppStatus.idle);
+    _commitSegment();
+    // 短時間に失敗が続いたら（不安定）自動継続をやめて待機にフォールバック。
+    final now = DateTime.now();
+    if (_lastErrorAt != null &&
+        now.difference(_lastErrorAt!).inMilliseconds < 1200) {
+      _failCount++;
+    } else {
+      _failCount = 1;
+    }
+    _lastErrorAt = now;
+    if (_failCount >= 5) {
+      _failCount = 0;
+      try {
+        _speech.cancel();
+      } catch (_) {}
+      setState(() => _status = AppStatus.idle); // 待機（続けて話す/送信が出る）
+      return;
+    }
+    _relisten();
   }
 
+  /// 直前セッションを確実に止めてから聞き直す（本文は保持）。
+  void _relisten() {
+    if (_restarting) return;
+    _restarting = true;
+    Future.delayed(const Duration(milliseconds: 250), () async {
+      try {
+        if (!mounted || _status != AppStatus.listening) return;
+        if (_speech.isListening) {
+          try {
+            await _speech.stop();
+          } catch (_) {}
+          await Future.delayed(const Duration(milliseconds: 120));
+        }
+        if (!mounted || _status != AppStatus.listening) return;
+        await _beginListen();
+      } finally {
+        _restarting = false;
+      }
+    });
+  }
+
+  /// notListening 時の取りこぼし回収（通常は finalResult が積み上げ済みで partial は空）。
   void _commitSegment() {
     if (_partial.trim().isNotEmpty) {
       _accumulated = '$_accumulated ${_partial.trim()}'.trim();
     }
     _partial = '';
+    _evaluateTrigger();
   }
 
-  void _scheduleLongRestart() {
-    Future.delayed(const Duration(milliseconds: 400), () async {
-      if (!mounted || _finishing || _status != AppStatus.listening) return;
-      if (_speech.isListening) return;
-      await _startListening(resume: true);
+  /// 余分な空白・末尾の句読点を落とす。
+  String _norm(String s) =>
+      s.replaceAll(RegExp(r'[\s。、，．！？!?,.]+$'), '').trim();
+
+  String get _triggerKey => _trigger.replaceAll(RegExp(r'\s'), '');
+
+  /// 認識テキストの「末尾」がトリガー語なら、カウントダウンを開始/維持。
+  /// それ以外（新しい言葉が続いた）なら、カウントダウンを取りやめる。
+  void _evaluateTrigger() {
+    final full = '$_accumulated $_partial';
+    final key = _norm(full).replaceAll(RegExp(r'\s'), '');
+    final trig = _triggerKey;
+    final hit = trig.isNotEmpty && key.endsWith(trig);
+    if (hit) {
+      if (_countdown == null) _startCountdown();
+    } else {
+      if (_countdown != null) _cancelCountdown();
+    }
+  }
+
+  void _startCountdown() {
+    _countdownTimer?.cancel();
+    setState(() => _countdown = _countdownSecs);
+    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      final next = (_countdown ?? 0) - 1;
+      if (next <= 0) {
+        _sendNow();
+      } else {
+        setState(() => _countdown = next);
+      }
     });
   }
 
-  void _finalizeAndOpen() {
-    final text = _accumulated.trim();
+  void _cancelCountdown() {
+    _countdownTimer?.cancel();
+    _countdownTimer = null;
+    if (mounted) setState(() => _countdown = null);
+  }
+
+  /// 送信本文。トリガー語は（途中で取りやめた分も含め）全て除去し、本文は丸ごと引き継ぐ。
+  String _sendBody() {
+    var body = '$_accumulated $_partial';
+    final trig = _trigger.trim();
+    if (trig.isNotEmpty) body = body.replaceAll(trig, ' ');
+    return body.replaceAll(RegExp(r'\s+'), ' ').trim();
+  }
+
+  /// 今すぐ送信（カウントダウン0・「今すぐ送信」・手動タップ共通）。
+  void _sendNow() {
+    _countdownTimer?.cancel();
+    _countdownTimer = null;
+    _countdown = null;
+    final text = _sendBody();
+    _speech.cancel();
     _accumulated = '';
-    _finishing = false;
+    _partial = '';
+    if (text.isEmpty) {
+      // 本文が空なら送らず、聞き直す。
+      setState(() {});
+      _startFresh();
+      return;
+    }
     setState(() {
       _status = AppStatus.idle;
       _lastText = text;
     });
-    // 長文モードは「停止して送信」操作なので必ず開く。通常モードは設定に従う。
-    final shouldOpen = _longMode || _autoOpen;
-    if (text.isNotEmpty && shouldOpen) {
-      _openTarget(text);
-    }
+    _openTarget(text);
   }
 
-  Future<void> _startListening({bool resume = false}) async {
-    if (_speech.isListening) return;
+  /// 新規に聞き始める（本文クリア）。アイドルからのタップ／起動時／送信後用。
+  Future<void> _startFresh() async {
     if (!_speechReady) {
-      _speechReady = await _speech.initialize();
+      _speechReady = await _speech.initialize(
+        onStatus: _onSpeechStatus,
+        onError: (_) => _onSpeechError(),
+      );
       if (!_speechReady) return;
     }
     if (!_isConfigured) {
       _openSettings();
       return;
     }
-    if (!resume) {
-      _accumulated = '';
-      _finishing = false;
+    _accumulated = '';
+    _partial = '';
+    _failCount = 0;
+    _cancelCountdown();
+    if (_speech.isListening) {
+      try {
+        await _speech.stop();
+      } catch (_) {}
+      await Future.delayed(const Duration(milliseconds: 120));
     }
+    await _beginListen();
+  }
+
+  /// 実際の listen 呼び出し（本文は保持）。
+  Future<void> _beginListen() async {
+    if (!mounted || _speech.isListening) return;
     setState(() {
       _status = AppStatus.listening;
       _partial = '';
@@ -213,24 +328,44 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     await _speech.listen(
       listenOptions: SpeechListenOptions(
         partialResults: true,
-        // 長文モードはエラーでセッションを切らず自前で聞き直す。
-        cancelOnError: !_longMode,
+        cancelOnError: false, // エラーでも自前で聞き直す
         listenMode: ListenMode.dictation,
         localeId: 'ja_JP',
-        // 通常モードは長めにして思考の間で切れにくく。長文モードは継続するので短め。
-        pauseFor: Duration(seconds: _longMode ? 3 : 5),
+        pauseFor: const Duration(seconds: 4),
       ),
       onResult: (result) {
         if (!mounted) return;
-        setState(() => _partial = result.recognizedWords);
+        // 確定結果は即 accumulated に固定（巻き戻り防止）。interim は partial に。
+        if (result.finalResult) {
+          final w = result.recognizedWords.trim();
+          if (w.isNotEmpty) _accumulated = '$_accumulated $w'.trim();
+          _partial = '';
+        } else {
+          _partial = result.recognizedWords;
+        }
+        setState(() {});
+        _evaluateTrigger();
       },
     );
   }
 
-  /// 長文モードでは「停止して送信」を意味する。
-  Future<void> _stopListening() async {
-    if (_longMode) _finishing = true;
-    await _speech.stop();
+  /// マイクタップ：本文があれば今すぐ送信、無ければリスニング停止。
+  void _toggleMic() {
+    if (_status == AppStatus.listening) {
+      if (_sendBody().isNotEmpty) {
+        _sendNow();
+      } else {
+        _cancelCountdown();
+        _speech.cancel();
+        _accumulated = '';
+        setState(() {
+          _status = AppStatus.idle;
+          _partial = '';
+        });
+      }
+    } else if (_status == AppStatus.idle) {
+      _startFresh();
+    }
   }
 
   /// 設定中の送信先を、本文入力済みの状態で開く。送信はユーザーが1タップ。
@@ -268,7 +403,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
     setState(() => _status = AppStatus.opening);
     // この直後に外部アプリへ離れる。戻ってきた時の自動リスンを1回だけ抑止。
-    _returningFromTelegram = true;
+    _returningFromTarget = true;
 
     bool ok = false;
     try {
@@ -294,10 +429,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Future<void> _openSettings() async {
     final botCtrl = TextEditingController(text: _bot);
     final customCtrl = TextEditingController(text: _customTemplate);
+    final triggerCtrl = TextEditingController(text: _trigger);
     String provider = _provider;
     bool autoListen = _autoListen;
-    bool autoOpen = _autoOpen;
-    bool longMode = _longMode;
+    double secs = _countdownSecs.toDouble();
     ThemeMode mode = themeMode.value;
 
     final saved = await showDialog<bool>(
@@ -368,25 +503,35 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     themeMode.value = m; // 即プレビュー
                   },
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 20),
+                TextField(
+                  controller: triggerCtrl,
+                  decoration: const InputDecoration(
+                    labelText: '送信トリガー語',
+                    hintText: '送信して',
+                    helperText: '文末でこの語を言うとカウントダウン開始',
+                  ),
+                  autocorrect: false,
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  '送信までの秒数: ${secs.round()}秒',
+                  style: TextStyle(color: ctx.tokens.text),
+                ),
+                Slider(
+                  value: secs,
+                  min: 2,
+                  max: 8,
+                  divisions: 6,
+                  label: '${secs.round()}秒',
+                  onChanged: (v) => setLocal(() => secs = v),
+                ),
+                const SizedBox(height: 4),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   title: const Text('起動時に自動で聞き始める'),
                   value: autoListen,
                   onChanged: (v) => setLocal(() => autoListen = v),
-                ),
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text('話し終えたら自動で送信先を開く'),
-                  value: autoOpen,
-                  onChanged: (v) => setLocal(() => autoOpen = v),
-                ),
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text('長文モード'),
-                  subtitle: const Text('無音で勝手に送らず、自分で停止するまで聞き続ける'),
-                  value: longMode,
-                  onChanged: (v) => setLocal(() => longMode = v),
                 ),
               ],
             ),
@@ -411,14 +556,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _provider = provider;
       _customTemplate = customCtrl.text.trim();
       _autoListen = autoListen;
-      _autoOpen = autoOpen;
-      _longMode = longMode;
+      _trigger = triggerCtrl.text.trim().isEmpty
+          ? '送信して'
+          : triggerCtrl.text.trim();
+      _countdownSecs = secs.round();
       await prefs.setString(_kBot, _bot);
       await prefs.setString(_kProvider, _provider);
       await prefs.setString(_kCustomTemplate, _customTemplate);
       await prefs.setBool(_kAutoListen, _autoListen);
-      await prefs.setBool(_kAutoOpen, _autoOpen);
-      await prefs.setBool(_kLongMode, _longMode);
+      await prefs.setString(_kTrigger, _trigger);
+      await prefs.setInt(_kCountdownSecs, _countdownSecs);
       await prefs.setString(_kThemeMode, _modeToString(mode));
       themeMode.value = mode;
       if (mounted) setState(() {});
@@ -434,9 +581,24 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final listening = _status == AppStatus.listening;
     final opening = _status == AppStatus.opening;
+    final counting = _countdown != null;
     final running = '$_accumulated $_partial'.trim();
-    final shown = listening ? running : _lastText;
+    final composed = _sendBody(); // 確定待ちの本文（トリガー語除去済み）
+    // 待機中（セッション終了・本文あり・カウントなし）＝追記/送信できる状態。
+    final paused = !listening && !counting && composed.isNotEmpty;
+    final shown = listening
+        ? running
+        : (composed.isNotEmpty ? composed : _lastText);
     final iconBrightness = isDark ? Brightness.light : Brightness.dark;
+
+    // 認識中は最新の行が見えるよう、毎フレーム最下部へ追従。
+    if (listening) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_previewScroll.hasClients) {
+          _previewScroll.jumpTo(_previewScroll.position.maxScrollExtent);
+        }
+      });
+    }
 
     return AnnotatedRegion<SystemUiOverlayStyle>(
       value: SystemUiOverlayStyle(
@@ -486,48 +648,64 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     style: TextStyle(color: t.text),
                   ),
                 ),
-              Expanded(
-                child: Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Text(
-                        listening
-                            ? '聞いてるよ…'
+              const SizedBox(height: 4),
+              Text(
+                counting
+                    ? '送信まで $_countdown'
+                    : listening
+                        ? '聞いてるよ…（「$_trigger」で送信）'
+                        : paused
+                            ? '続けて話す or 送信'
                             : shown.isEmpty
                                 ? 'マイクを押して話しかけてね'
-                                : '認識したよ',
-                        style: TextStyle(
-                          color: listening ? t.accent : t.text,
-                          fontSize: 15,
-                          letterSpacing: 0.2,
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-                      if (shown.isNotEmpty)
-                        Container(
-                          padding: const EdgeInsets.all(18),
-                          decoration: BoxDecoration(
-                            color: t.surface,
-                            borderRadius:
-                                BorderRadius.circular(AppRadius.surface),
-                            border: Border.all(color: t.hairline),
-                          ),
-                          child: Text(
-                            shown,
-                            style: TextStyle(
-                              fontSize: 20,
-                              color: t.textHover,
-                              height: 1.4,
-                            ),
-                            textAlign: TextAlign.center,
-                          ),
-                        ),
-                    ],
-                  ),
+                                : '送信したよ',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: (listening || counting) ? t.accent : t.text,
+                  fontSize: counting ? 22 : 15,
+                  fontWeight: counting ? FontWeight.w700 : FontWeight.w400,
+                  letterSpacing: 0.2,
                 ),
               ),
-              if (_lastText.isNotEmpty && !listening)
+              const SizedBox(height: 12),
+              // プレビュー：残りの縦スペースいっぱい＋中身はスクロール可能。
+              Expanded(
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(18),
+                  decoration: BoxDecoration(
+                    color: t.surface,
+                    borderRadius: BorderRadius.circular(AppRadius.surface),
+                    border: Border.all(color: t.hairline),
+                  ),
+                  child: shown.isEmpty
+                      ? Center(
+                          child: Text(
+                            'ここに認識結果が出るよ',
+                            style: TextStyle(
+                              color: t.text.withValues(alpha: 0.4),
+                              fontSize: 14,
+                            ),
+                          ),
+                        )
+                      : Scrollbar(
+                          controller: _previewScroll,
+                          child: SingleChildScrollView(
+                            controller: _previewScroll,
+                            child: Text(
+                              shown,
+                              style: TextStyle(
+                                fontSize: 20,
+                                color: t.textHover,
+                                height: 1.5,
+                              ),
+                            ),
+                          ),
+                        ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              if (_lastText.isNotEmpty && !listening && !counting && !paused)
                 Padding(
                   padding: const EdgeInsets.only(bottom: 12),
                   child: OutlinedButton.icon(
@@ -536,18 +714,59 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     label: const Text('送信先をもう一度開く'),
                   ),
                 ),
-              _MicButton(
-                listening: listening,
-                opening: opening,
-                longMode: _longMode,
-                onTap: () {
-                  if (listening) {
-                    _stopListening();
-                  } else if (!opening) {
-                    _startListening();
-                  }
-                },
-              ),
+              if (counting)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 16),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: _cancelCountdown,
+                          child: const Text('キャンセル'),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: FilledButton.icon(
+                          onPressed: _sendNow,
+                          icon: const Icon(Icons.send),
+                          label: const Text('今すぐ送信'),
+                        ),
+                      ),
+                    ],
+                  ),
+                )
+              else if (paused)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 16),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: opening ? null : () => _beginListen(),
+                          icon: const Icon(Icons.mic),
+                          label: const Text('続けて話す'),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: FilledButton.icon(
+                          onPressed: opening ? null : _sendNow,
+                          icon: const Icon(Icons.send),
+                          label: const Text('送信'),
+                        ),
+                      ),
+                    ],
+                  ),
+                )
+              else
+                _MicButton(
+                  listening: listening,
+                  opening: opening,
+                  onTap: () {
+                    if (!opening) _toggleMic();
+                  },
+                ),
             ],
           ),
         ),
@@ -660,13 +879,11 @@ class _MicButton extends StatelessWidget {
   const _MicButton({
     required this.listening,
     required this.opening,
-    required this.longMode,
     required this.onTap,
   });
 
   final bool listening;
   final bool opening;
-  final bool longMode;
   final VoidCallback onTap;
 
   @override
@@ -676,7 +893,7 @@ class _MicButton extends StatelessWidget {
     final label = opening
         ? '送信先を開いてるよ…'
         : listening
-            ? (longMode ? 'タップで停止して送信' : 'タップで停止')
+            ? 'タップで今すぐ送信'
             : 'タップで話す';
     return Column(
       mainAxisSize: MainAxisSize.min,
