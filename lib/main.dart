@@ -62,6 +62,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   static const _kCustomTemplate = 'custom_template';
   static const _kAutoListen = 'auto_listen';
   static const _kTrigger = 'trigger_phrase';
+  static const _kResetTrigger = 'reset_trigger';
   static const _kCountdownSecs = 'countdown_secs';
   static const _kThemeMode = 'theme_mode';
 
@@ -77,6 +78,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool _autoListen = true;
   // 文末でこの語を言うと送信カウントダウン開始。
   String _trigger = '送信して';
+  // 文末でこの語を言うと書き起こしをリセット。
+  String _resetTrigger = 'リセット';
   int _countdownSecs = 3;
   bool _didAutoStart = false;
   // 送信先アプリへ離れて戻ってきた直後は、勝手に聞き始めない。
@@ -140,6 +143,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _customTemplate = prefs.getString(_kCustomTemplate) ?? '';
     _autoListen = prefs.getBool(_kAutoListen) ?? true;
     _trigger = prefs.getString(_kTrigger) ?? '送信して';
+    _resetTrigger = prefs.getString(_kResetTrigger) ?? 'リセット';
     _countdownSecs = prefs.getInt(_kCountdownSecs) ?? 3;
     themeMode.value = _parseMode(prefs.getString(_kThemeMode));
 
@@ -231,12 +235,20 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       s.replaceAll(RegExp(r'[\s。、，．！？!?,.]+$'), '').trim();
 
   String get _triggerKey => _trigger.replaceAll(RegExp(r'\s'), '');
+  String get _resetKey => _resetTrigger.replaceAll(RegExp(r'\s'), '');
 
-  /// 認識テキストの「末尾」がトリガー語なら、カウントダウンを開始/維持。
-  /// それ以外（新しい言葉が続いた）なら、カウントダウンを取りやめる。
+  /// 認識テキストの末尾が「リセット語」なら即クリア、「送信語」ならカウントダウン。
   void _evaluateTrigger() {
     final full = '$_accumulated $_partial';
     final key = _norm(full).replaceAll(RegExp(r'\s'), '');
+
+    // リセット語が末尾 → 書き起こしを消してまっさらで聞き直す。
+    if (_resetKey.isNotEmpty && key.endsWith(_resetKey)) {
+      _reset();
+      return;
+    }
+
+    // 送信語が末尾 → カウントダウン開始/維持。それ以外は取りやめ。
     final trig = _triggerKey;
     final hit = trig.isNotEmpty && key.endsWith(trig);
     if (hit) {
@@ -442,6 +454,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final botCtrl = TextEditingController(text: _bot);
     final customCtrl = TextEditingController(text: _customTemplate);
     final triggerCtrl = TextEditingController(text: _trigger);
+    final resetCtrl = TextEditingController(text: _resetTrigger);
     String provider = _provider;
     bool autoListen = _autoListen;
     double secs = _countdownSecs.toDouble();
@@ -449,6 +462,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
     final saved = await showDialog<bool>(
       context: context,
+      barrierDismissible: false, // 誤タップで閉じないように
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setLocal) => AlertDialog(
           title: const Text('設定'),
@@ -525,6 +539,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   ),
                   autocorrect: false,
                 ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: resetCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'リセット語',
+                    hintText: 'リセット',
+                    helperText: '文末でこの語を言うと書き起こしを消去',
+                  ),
+                  autocorrect: false,
+                ),
                 const SizedBox(height: 16),
                 Text(
                   '送信までの秒数: ${secs.round()}秒',
@@ -571,12 +595,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _trigger = triggerCtrl.text.trim().isEmpty
           ? '送信して'
           : triggerCtrl.text.trim();
+      _resetTrigger = resetCtrl.text.trim().isEmpty
+          ? 'リセット'
+          : resetCtrl.text.trim();
       _countdownSecs = secs.round();
       await prefs.setString(_kBot, _bot);
       await prefs.setString(_kProvider, _provider);
       await prefs.setString(_kCustomTemplate, _customTemplate);
       await prefs.setBool(_kAutoListen, _autoListen);
       await prefs.setString(_kTrigger, _trigger);
+      await prefs.setString(_kResetTrigger, _resetTrigger);
       await prefs.setInt(_kCountdownSecs, _countdownSecs);
       await prefs.setString(_kThemeMode, _modeToString(mode));
       themeMode.value = mode;
