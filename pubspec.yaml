@@ -107,6 +107,7 @@ flutter:
 # ランチャーアイコン生成設定（dart run flutter_launcher_icons で適用）
 flutter_launcher_icons:
   android: true
+  # iOS は ライト/ダーク適応アイコンを AppIcon.appiconset で手動管理（上書き防止のため false）。
   ios: false
   image_path: "assets/icon/app_icon_dark.png"
   min_sdk_android: 21
