@@ -6,7 +6,7 @@ plugins {
 }
 
 android {
-    namespace = "com.koyama.koe_secretary"
+    namespace = "com.yamawanemo.koe_secretary"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -21,7 +21,7 @@ android {
 
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.koyama.koe_secretary"
+        applicationId = "com.yamawanemo.koe_secretary"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = 30 // vosk_flutter_2 が要求（Android 11+）
