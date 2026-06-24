@@ -46,3 +46,7 @@ app.*.map.json
 
 # Vosk model (download separately, see README)
 assets/models/*.zip
+
+# 配布ビルド成果物・note原稿（公開しない）
+*.apk
+koely-note-article.md
