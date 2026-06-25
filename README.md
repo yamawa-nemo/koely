@@ -4,7 +4,11 @@
 >
 > 声で話しかけると、その内容がチャットアプリに入力済みで開く。あとは送信ボタンを押すだけ。
 
-**Koely** is a tiny Android app that turns a spoken phrase into a **pre-filled message** in Telegram — or any app, via a custom URL template. Say *"Hey Google, open コエリー"*, speak your message, and Koely drops the text into the target chat. You just tap **send**.
+<p align="center">
+  <img src="docs/koely-demo.gif" alt="Koely demo" width="720">
+</p>
+
+**Koely** is a small Flutter app (iOS / Android) that turns a spoken phrase into a **pre-filled message** in Telegram — or any app, via a custom URL template. Say *"Hey Siri, open コエリー"*, speak your message, and Koely drops the text into the target chat. You just tap **send**.
 
 It was built as a hands-free front-end for a personal Telegram-based AI-secretary bot, but it works with **any** Telegram bot or deep-link target.
 
@@ -15,17 +19,17 @@ It was built as a hands-free front-end for a personal Telegram-based AI-secretar
 Opening a chat app → tapping the input → tapping the mic → tapping send is too many steps when your hands are busy (walking, commuting, lying down). Koely collapses that into:
 
 ```
-"Hey Google, open コエリー"  →  speak  →  one tap to send
+"Hey Siri, open コエリー"  →  speak  →  "送信して"  →  one tap to send
 ```
 
 ## How it works
 
 ```
-"Hey Google, open コエリー"
+"Hey Siri, open コエリー"
    └─ app comes to front and auto-starts the mic
-        └─ you speak
-             └─ on silence (or you tap stop)
-                  └─ Koely opens the target chat with your text pre-filled
+        └─ you speak (continuous dictation, no time limit)
+             └─ say "送信して" (or your custom trigger word)
+                  └─ countdown (3s default) → Koely opens the target chat with your text pre-filled
                        └─ you tap send  →  the chat app delivers it
 ```
 
@@ -33,12 +37,13 @@ The agent that actually *does* things (e.g. a Telegram bot wired to an LLM) live
 
 ## Features
 
-- **Hands-free launch** via *"Hey Google, open コエリー"*; auto-starts listening every time it comes to the foreground.
+- **Hands-free launch** via *"Hey Siri, open コエリー"* (iOS) or *"Hey Google, open コエリー"* (Android); auto-starts listening on foreground.
 - **Speak → pre-filled message** in the target chat (one tap to send).
 - **Voice send trigger:** say a configurable word (default 「送信して」) at the end and a short countdown fires, then it opens the chat — fully hands-free. Keep talking and the countdown resets.
-- **Continuous dictation:** keeps listening through phrase pauses (re-arms across Android's silence cutoffs); finalized words are locked in so the transcript never rolls back.
+- **Voice reset:** say a configurable word (default 「リセット」) to clear the transcript and start over — no need to touch the screen.
+- **Continuous dictation:** keeps listening through phrase pauses; finalized words are locked in so the transcript never rolls back.
 - **Providers:** Telegram (bot username) or a **Custom URL template** with a `{text}` placeholder → works with LINE, WhatsApp, SMS, and more.
-- **System / Light / Dark** themes with a custom sliding toggle.
+- **System / Light / Dark** themes with a custom sliding toggle; adaptive app icon (light/dark).
 - A small, **portable design system** (`lib/theme.dart`) so the same look drops into future apps.
 
 ## Providers
@@ -61,20 +66,32 @@ The agent that actually *does* things (e.g. a Telegram bot wired to an LLM) live
 - **Why Telegram + a generic Custom template, instead of per-app integrations?**
   A `{text}` URL template covers any app that exposes a prefill deep link (LINE, WhatsApp, SMS, Signal…) with **zero extra code** — far more maintainable for an OSS tool than hardcoding each provider.
 
-- **Keyword send + the Android speech quirk.**
-  Android's `SpeechRecognizer` finalizes on its *own* ~2s silence (and by phrase), largely ignoring longer pause settings — so a plain "send after N seconds of silence" fires unpredictably. Koely instead **sends on a spoken trigger word** and re-arms the recognizer across cutoffs to keep one continuous transcript. Crucially, **final results are committed immediately** (interim results only live in a separate buffer), so re-arming never rolls back or drops text.
+- **Why a spoken trigger word instead of silence-based send?**
+  Android's `SpeechRecognizer` finalizes on its own ~2s silence, largely ignoring longer pause settings — so a "send after N seconds of silence" fires unpredictably. Koely instead **sends on a spoken trigger word** and re-arms the recognizer across cutoffs to keep one continuous transcript. On iOS, Apple's `SFSpeechRecognizer` handles continuous dictation far more gracefully, but the trigger-word pattern works well on both platforms.
 
 - **Design system.**
   Colors, radii, and typography live in `lib/theme.dart` as portable tokens, so the visual language is reusable across apps. Latin text uses **Inter**; Japanese falls back to **Noto Sans JP** (Inter ships no Japanese glyphs).
 
-## Build & install
+## Build & run
 
 Requires [Flutter](https://flutter.dev).
+
+### iOS (recommended)
+
+```bash
+flutter pub get
+flutter run          # with device connected
+# or: flutter build ios --release
+```
+
+> Free Apple ID signing works (Settings → Signing & Capabilities → Personal Team). The device must trust the developer profile once after install.
+
+### Android
 
 ```bash
 flutter pub get
 flutter build apk --release
-# then install build/app/outputs/flutter-apk/app-release.apk on your device
+# install build/app/outputs/flutter-apk/app-release.apk
 ```
 
 > If your system JDK is too new for the bundled Gradle, point the project at JDK 17 in `android/gradle.properties`:
@@ -86,24 +103,13 @@ flutter build apk --release
 2. Pick a **provider**:
    - **Telegram** — enter your bot's username (without `@`).
    - **Custom** — enter a URL template containing `{text}`.
-3. Set the **trigger word** (default 「送信して」) and the **countdown seconds** (2–8s).
+3. Set the **send trigger word** (default 「送信して」), **reset trigger word** (default 「リセット」), and **countdown seconds** (2–8s).
 4. Optionally toggle auto-listen and pick a theme.
-
-### Hands-free trigger
-
-1. Set **Google Assistant** as your default assistant and enable *"Hey Google"* / Voice Match.
-2. Say *"Hey Google, open コエリー"* (the launcher label is **コエリー**; the brand name is **Koely**).
-3. On aggressive OEM ROMs (e.g. ColorOS), exempt the Google app from battery optimization so the hotword keeps working in the background.
-
-## Tech stack
-
-Flutter · `speech_to_text` · `url_launcher` · `shared_preferences` · `google_fonts` · `flutter_launcher_icons`
 
 ## Limitations
 
-- **Android only.**
-- *"Hey Google → arbitrary single utterance"* isn't possible: Google locked down custom Assistant actions, so the reliable pattern is **open the app, then speak**.
 - The one send tap is **by design** (anti-spam in the chat apps).
+- iOS distribution requires Apple Developer Program ($99/yr) for TestFlight / App Store; free signing is limited to your own device with a 7-day re-sign cycle.
 
 ## License
 
